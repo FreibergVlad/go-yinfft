@@ -1,0 +1,5 @@
+- add github actions
+- add debug logging
+- add unit tests
+- add benchmarks
+- optimize implementation if necessary
