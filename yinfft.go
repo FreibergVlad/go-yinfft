@@ -6,17 +6,19 @@ import (
 	"fmt"
 	"maps"
 	"math"
-	"math/cmplx"
 	"slices"
 	"strings"
 
+	"github.com/FreibergVlad/go-yinfft/internal"
+	"github.com/FreibergVlad/go-yinfft/internal/peakdetector"
 	"github.com/mjibson/go-dsp/fft"
 )
 
-const curveSize = 34
+type logger interface {
+	Debug(msg string, args ...any)
+}
 
 type (
-	weightingCurve [curveSize]float32
 	// Params defines configuration options for the YinFFT pitch detector.
 	Params struct {
 		FrameSize         int     // Length of the input audio frame in samples.
@@ -26,6 +28,7 @@ type (
 		WeightingType     string  // Type of weighting curve to apply (e.g., "A", "B", "C", "D", "CUSTOM").
 		MinFrequency      float64 // Minimum detectable frequency in Hz.
 		MaxFrequency      float64 // Maximum detectable frequency in Hz.
+		Logger            logger  // Optional logger for debug messages.
 	}
 	// PitchDetector is the main structure for detecting pitch using the YinFFT algorithm.
 	PitchDetector struct {
@@ -33,15 +36,12 @@ type (
 		weights          []float64
 		minPeriodSamples int
 		maxPeriodSamples int
+		peakDetector     *peakdetector.PeakDetector
 	}
 )
 
 var (
-	frequencyBands = [curveSize]float32{
-		0, 20, 25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630, 800, 1000, 1250,
-		1600, 2000, 2500, 3150, 4000, 5000, 6300, 8000, 9000, 10000, 12500, 15000, 20000, 25100,
-	}
-	weightingCurves = map[string]weightingCurve{
+	weightingCurves = map[string]internal.WeightingCurve{
 		"EMPTY": {},
 		"CUSTOM": {
 			-75.8, -70.1, -60.8, -52.1, -44.2, -37.5, -31.3, -25.6, -20.9, -16.5, -12.6, -9.6, -7.0, -4.7, -3.0, -1.8,
@@ -65,8 +65,8 @@ var (
 		},
 	}
 	availableWeightingTypes = slices.Collect(maps.Keys(weightingCurves))
-	defaultParams           = Params{
-		FrameSize:         4096,
+	DefaultParams           = Params{
+		FrameSize:         8192,
 		SampleRate:        44100,
 		ShouldInterpolate: true,
 		Tolerance:         1,
@@ -95,17 +95,33 @@ func New(params Params) (*PitchDetector, error) {
 		)
 	}
 
+	peakDetector, err := peakdetector.New(
+		peakdetector.Params{
+			Range:             float64(params.FrameSize)/2 + 1,
+			MaxPeaks:          1,
+			MaxPosition:       float64(maxPeriodSamples),
+			MinPosition:       float64(minPeriodSamples),
+			Threshold:         math.Inf(-1),
+			OrderBy:           peakdetector.PeakOrderByAmplitude,
+			ShouldInterpolate: params.ShouldInterpolate,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize peak detection algorithm: %w", err)
+	}
+
 	return &PitchDetector{
 		params:           params,
-		weights:          computeSpectrumWeights(params.FrameSize, params.SampleRate, curve),
+		weights:          internal.ComputeSpectrumWeights(params.FrameSize, params.SampleRate, curve),
 		minPeriodSamples: minPeriodSamples,
 		maxPeriodSamples: maxPeriodSamples,
+		peakDetector:     peakDetector,
 	}, nil
 }
 
 // NewWithDefaultParams creates a PitchDetector with built-in default settings.
 func NewWithDefaultParams() (*PitchDetector, error) {
-	return New(defaultParams)
+	return New(DefaultParams)
 }
 
 // DetectFromFrame applies windowing and FFT to the input audio frame, then detects the fundamental frequency.
@@ -114,7 +130,7 @@ func (pd *PitchDetector) DetectFromFrame(frame []float64) (frequency float64, co
 	if len(frame) != pd.params.FrameSize {
 		return 0, 0, fmt.Errorf("invalid frame size: expected %d, got %d", pd.params.FrameSize, len(frame))
 	}
-	return pd.DetectFromSpectrum(prepareSpectrum(frame))
+	return pd.DetectFromSpectrum(internal.PrepareSpectrum(frame))
 }
 
 // DetectFromSpectrum detects the fundamental frequency assuming the input is a magnitude spectrum. The spectrum should
@@ -139,7 +155,7 @@ func (pd *PitchDetector) DetectFromSpectrum(spectrum []float64) (frequency float
 		return 0, 0, nil
 	}
 
-	magnitude, phase := cartesianToPolar(fft.FFTReal(sqrMag))
+	magnitude, phase := internal.CartesianToPolar(fft.FFTReal(sqrMag))
 
 	yin := make([]float64, yinLen)
 	yin[0] = 1
@@ -156,7 +172,19 @@ func (pd *PitchDetector) DetectFromSpectrum(spectrum []float64) (frequency float
 
 	var tau, yinMin float64
 	if pd.params.ShouldInterpolate {
-		return 0, 0, fmt.Errorf("interpolation is not yet implemented")
+		for i := range yin {
+			yin[i] = -yin[i]
+		}
+		positions, amplitudes, err := pd.peakDetector.DetectPeaks(yin)
+		if err != nil {
+			return 0, 0, fmt.Errorf("peak detection error: %v", err)
+		}
+		if len(positions) > 0 && len(amplitudes) > 0 {
+			tau = positions[0]
+			yinMin = -amplitudes[0]
+		} else {
+			return 0, 0, fmt.Errorf("no peaks found by peak detection algorithm")
+		}
 	} else {
 		yinMin = yin[pd.minPeriodSamples]
 		for i := pd.minPeriodSamples; i <= pd.maxPeriodSamples; i++ {
@@ -172,65 +200,4 @@ func (pd *PitchDetector) DetectFromSpectrum(spectrum []float64) (frequency float
 	}
 
 	return 0, 0, nil
-}
-
-func computeSpectrumWeights(frameSize int, sampleRate float64, curve weightingCurve) []float64 {
-	weights := make([]float64, frameSize/2+1)
-	j := 1
-
-	for i := range len(weights) {
-		frequency := float64(i) / float64(frameSize) * sampleRate
-		for j < curveSize-1 && frequency > float64(frequencyBands[j]) {
-			j++
-		}
-
-		a0 := float64(curve[j-1])
-		a1 := float64(curve[j])
-		f0 := float64(frequencyBands[j-1])
-		f1 := float64(frequencyBands[j])
-
-		var weight float64
-		switch {
-		case f0 == f1:
-			weight = a0
-		case f0 == 0:
-			weight = (a1-a0)/f1*frequency + a0
-		default:
-			weight = (a1-a0)/(f1-f0)*frequency + (a0 - (a1-a0)/(f1/f0-1.0))
-		}
-
-		weights[i] = math.Pow(10, weight/20)
-	}
-
-	return weights
-}
-
-func cartesianToPolar(complex []complex128) (magnitude []float64, phase []float64) {
-	magnitude, phase = make([]float64, len(complex)), make([]float64, len(complex))
-
-	for i, cnum := range complex {
-		magnitude[i] = math.Sqrt(math.Pow(real(cnum), 2) + math.Pow(imag(cnum), 2))
-		phase[i] = math.Atan2(imag(cnum), real(cnum))
-	}
-
-	return
-}
-
-func prepareSpectrum(frame []float64) []float64 {
-	applyHannWindow(frame)
-
-	complexSpectrum := fft.FFTReal(frame)
-
-	spectrum := make([]float64, len(complexSpectrum)/2+1)
-	for i := range len(spectrum) {
-		spectrum[i] = cmplx.Abs(complexSpectrum[i])
-	}
-
-	return spectrum
-}
-
-func applyHannWindow(frame []float64) {
-	for i := range frame {
-		frame[i] *= 0.5 * (1 - math.Cos(2*math.Pi*float64(i)/float64(len(frame)-1)))
-	}
 }
